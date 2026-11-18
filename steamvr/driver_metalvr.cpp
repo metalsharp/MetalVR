@@ -161,9 +161,55 @@ public:
     system_.ipd = ipd;
   }
 
+  // The tracking samples the headset's recent poses came from. A frame names the one it was rendered with in
+  // FRAME_END: the headset reprojects from that sample's pose, and metalvrd's ALVR driver drops a frame that names
+  // none. SteamVR does not say which pose it rendered with, only the pose itself (SubmitLayer's mHmdPose), so the
+  // sample is found by its orientation, as ALVR's own SteamVR driver does.
+  void noteSample(uint64_t sample_id, const mvr_quat &orientation) {
+    if (sample_id == 0)
+      return;
+    std::lock_guard<std::mutex> lock(samples_mutex_);
+    Sample &last = samples_[(next_sample_ + kSamples - 1) % kSamples];
+    if (last.id == sample_id)
+      return;
+    samples_[next_sample_] = {sample_id, orientation};
+    next_sample_ = (next_sample_ + 1) % kSamples;
+  }
+
+  // the recent sample whose orientation is nearest the one given (the newest of equals); 0 before any
+  uint64_t sampleFor(const mvr_quat &q) const {
+    std::lock_guard<std::mutex> lock(samples_mutex_);
+    uint64_t best = 0;
+    float best_dot = -1.0f;
+    for (size_t i = 0; i < kSamples; ++i) {
+      const Sample &s = samples_[(next_sample_ + kSamples - 1 - i) % kSamples]; // newest first
+      if (s.id == 0)
+        break;
+      const float d = std::fabs(q.x * s.orientation.x + q.y * s.orientation.y + q.z * s.orientation.z +
+                                q.w * s.orientation.w);
+      // newest first, so an older sample has to be nearer by more than float noise (about 0.1 degrees) to win:
+      // a still head leaves many samples alike, and the newest of them is the one rendered with
+      if (best == 0 || d > best_dot + kSampleMargin) {
+        best_dot = d;
+        best = s.id;
+      }
+    }
+    return best;
+  }
+
 private:
+  struct Sample {
+    uint64_t id = 0;
+    mvr_quat orientation{0, 0, 0, 1};
+  };
+  static constexpr size_t kSamples = 64; // the better part of a second at the headset's tracking rate
+  static constexpr float kSampleMargin = 4e-7f; // 1 - cos(0.05 degrees): two orientations 0.1 degrees apart
+
   Connection connection_;
   mvr_system_info system_{};
+  mutable std::mutex samples_mutex_;
+  std::array<Sample, kSamples> samples_{};
+  size_t next_sample_ = 0;
 };
 
 // ---- direct mode ----
@@ -323,6 +369,7 @@ public:
       waitForDrawing();
 
     std::vector<mvr_layer> out;
+    uint64_t render_sample = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       const mvr_system_info &system = link_.system();
@@ -355,6 +402,8 @@ public:
           // the head pose the frame was rendered with, and the eye beside it
           mvr_pose head{};
           head.orientation = quatFromMatrix(in.mHmdPose);
+          if (render_sample == 0)
+            render_sample = link_.sampleFor(head.orientation);
           head.position = {in.mHmdPose.m[0][3], in.mHmdPose.m[1][3], in.mHmdPose.m[2][3]};
           const mvr_vec3 offset = rotate(head.orientation, {(eye == 0 ? -0.5f : 0.5f) * system.ipd, 0, 0});
           view.pose.orientation = head.orientation;
@@ -375,6 +424,7 @@ public:
     beginSession();
     mvr_frame_end_request request{};
     request.frame_id = ++frame_id_;
+    request.sample_id = render_sample;
     request.display_time_ns = localNowNs() + link_.connection().clockOffsetNs();
     request.layer_count = static_cast<uint32_t>(out.size());
     mvr_result_response response{};
@@ -1185,6 +1235,8 @@ private:
       return pose;
     }
     const bool valid = (sample.flags & MVR_TRACKING_HEAD_VALID) != 0;
+    if (valid)
+      link_.noteSample(sample.sample_id, sample.head.orientation);
     pose.deviceIsConnected = (sample.flags & MVR_TRACKING_HMD_CONNECTED) != 0;
     pose.poseIsValid = valid;
     pose.result = valid ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
