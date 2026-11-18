@@ -153,6 +153,14 @@ public:
   Connection &connection() { return connection_; }
   const mvr_system_info &system() const { return system_; }
 
+  // The headset's own fields of view and eye distance, which a streamed headset (ALVR) reports only once it
+  // connects, usually after HELLO: until then the system info holds the model's defaults.
+  void setViews(const mvr_fov &left, const mvr_fov &right, float ipd) {
+    system_.fov[0] = left;
+    system_.fov[1] = right;
+    system_.ipd = ipd;
+  }
+
 private:
   Connection connection_;
   mvr_system_info system_{};
@@ -1206,6 +1214,8 @@ private:
       if (id_ != vr::k_unTrackedDeviceIndexInvalid) {
         mvr_tracking_response sample{};
         const vr::DriverPose_t head = pose(&sample);
+        if (head.deviceIsConnected)
+          updateViews(sample);
         vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id_, head, sizeof(vr::DriverPose_t));
         updateBattery(sample);
         if (head.poseIsValid != last_valid_ || head.deviceIsConnected != last_connected_) {
@@ -1221,6 +1231,57 @@ private:
       }
       Sleep(2); // about 500 poses a second
     }
+  }
+
+  // SteamVR renders each eye with the projection and eye position it was given, and metalvrd sends the eyes on as
+  // they are drawn, so they have to be the headset's own: a streamed headset displays each half of the frame with
+  // its real, asymmetric field of view, and an image drawn with another one sits shifted in each eye, which the eyes
+  // cannot fuse. Those arrive with the tracking once the headset has connected; SteamVR is told whenever they change,
+  // as ALVR's own driver does (SetDisplayEyeToHead, SetDisplayProjectionRaw).
+  void updateViews(const mvr_tracking_response &sample) {
+    const mvr_fov &l = sample.views[0].fov, &r = sample.views[1].fov;
+    const auto usable = [](const mvr_fov &f) {
+      return f.left < 0 && f.right > 0 && f.up > 0 && f.down < 0 && f.right - f.left < 3.0f && f.up - f.down < 3.0f;
+    };
+    if (!usable(l) || !usable(r))
+      return;
+    const mvr_vec3 a = sample.views[0].pose.position, b = sample.views[1].pose.position;
+    float ipd = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) + (b.z - a.z) * (b.z - a.z));
+    const mvr_system_info &system = link_.system();
+    if (!(ipd > 0.04f && ipd < 0.09f))
+      ipd = system.ipd > 0 ? system.ipd : 0.0635f;
+    const auto same = [](const mvr_fov &x, const mvr_fov &y) {
+      return std::fabs(x.left - y.left) < 1e-4f && std::fabs(x.right - y.right) < 1e-4f &&
+             std::fabs(x.up - y.up) < 1e-4f && std::fabs(x.down - y.down) < 1e-4f;
+    };
+    if (views_sent_ && same(l, system.fov[0]) && same(r, system.fov[1]) && std::fabs(ipd - system.ipd) < 1e-4f)
+      return;
+    link_.setViews(l, r, ipd);
+    views_sent_ = true;
+
+    vr::HmdMatrix34_t eye_to_head[2] = {};
+    for (int eye = 0; eye < 2; ++eye) {
+      eye_to_head[eye].m[0][0] = eye_to_head[eye].m[1][1] = eye_to_head[eye].m[2][2] = 1.0f;
+      eye_to_head[eye].m[0][3] = (eye == 0 ? -0.5f : 0.5f) * ipd;
+    }
+    vr::HmdRect2_t projection[2] = {};
+    for (int eye = 0; eye < 2; ++eye) {
+      // as Display::GetProjectionRaw: OpenVR's top is the tangent of the angle below the axis
+      const mvr_fov &f = eye == 0 ? l : r;
+      projection[eye].vTopLeft = {{std::tan(f.left), std::tan(f.down)}};
+      projection[eye].vBottomRight = {{std::tan(f.right), std::tan(f.up)}};
+    }
+    auto *host = vr::VRServerDriverHost();
+    host->SetDisplayEyeToHead(id_, eye_to_head[0], eye_to_head[1]);
+    host->SetDisplayProjectionRaw(id_, projection[0], projection[1]);
+    vr::VRProperties()->SetFloatProperty(container_, vr::Prop_UserIpdMeters_Float, ipd);
+    vr::VREvent_Data_t data{};
+    data.ipd.ipdMeters = ipd;
+    host->VendorSpecificEvent(id_, vr::VREvent_IpdChanged, data, 0);
+    log("metalvr: the headset's views: IPD %.1f mm, left eye %.1f %.1f %.1f %.1f, right eye %.1f %.1f %.1f %.1f "
+        "degrees (left, right, up, down)",
+        ipd * 1000.0f, l.left * 57.29578f, l.right * 57.29578f, l.up * 57.29578f, l.down * 57.29578f,
+        r.left * 57.29578f, r.right * 57.29578f, r.up * 57.29578f, r.down * 57.29578f);
   }
 
   // the headset's charge, when it reports one, a few times a minute
@@ -1240,6 +1301,7 @@ private:
   }
 
   bool last_valid_ = false, last_connected_ = false;
+  bool views_sent_ = false;
   bool battery_valid_ = false;
   ULONGLONG battery_set_ = 0;
   uint32_t headset_ = MVR_HEADSET_UNKNOWN;
