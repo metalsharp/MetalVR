@@ -836,11 +836,15 @@ public:
       mvr_vec3 offset{0, 0, 0};
       if (kind_ != MVR_CONTROLLERS_INDEX && kind_ != MVR_CONTROLLERS_VIVE_WAND) {
         // the controller's own frame, which SteamVR's Touch models place their grip and tip from: the grip pose
-        // without its offset (RiftLinux: 60 degrees about x, at 0, -0.032, 0.040). Lighthouse controllers report
-        // their own frame as the grip already.
-        const mvr_quat grip_rotation{0.5f, 0, 0, 0.8660254f};
+        // without its offset. SteamVR's render models for every Touch controller (CV1, Rift S, Quest 2, Touch Plus,
+        // Touch Pro) put their openxr_grip component 20.6 degrees about x from that frame, at +-0.007, -0.0018, 0.102
+        // (x mirrored for the right hand), and SteamVR's OpenXR rebuilds the grip from it, so taking the same
+        // transform off here gives an application the grip the headset reported. (60 degrees, used before, is the
+        // angle between the grip and the aim: openxr_aim is at -39.4.) Lighthouse controllers report their own frame
+        // as the grip already.
+        const mvr_quat grip_rotation{0.17880222f, 0, 0, 0.98388504f}; // 20.6 degrees about x
         q = quatMultiply(c.grip.orientation, quatConjugate(grip_rotation));
-        offset = rotate(q, {0, -0.03207f, 0.04045f});
+        offset = rotate(q, {hand_ == 0 ? 0.007f : -0.007f, -0.00182941f, 0.1019482f});
       }
       pose.qRotation = {q.w, q.x, q.y, q.z};
       pose.vecPosition[0] = c.grip.position.x - offset.x;
