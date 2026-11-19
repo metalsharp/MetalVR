@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -34,24 +35,83 @@ std::string lower(std::string s) {
   return s;
 }
 
-// a factor as Mullion takes it: a plain decimal number, never below 1
+// A number as Mullion's config parser reads one (Config::parseOptionValue for float): digits, then optionally a
+// point and more digits, whatever the locale. Accepted factors are never below 1 (as Mullion takes them) or above
+// kMaxFactor (MetalVR's limit: past it the eyes are too small to be worth scaling).
 bool parseFactor(const std::string &text, float *out) {
-  if (text.empty())
+  size_t pos = 0;
+  if (text.empty() || text[0] == '.')
     return false;
-  char *end = nullptr;
-  const double value = std::strtod(text.c_str(), &end);
-  if (!end || *end || !std::isfinite(value))
+  double whole = 0, fraction = 0, divisor = 1;
+  for (; pos < text.size() && text[pos] != '.'; ++pos) {
+    if (text[pos] < '0' || text[pos] > '9')
+      return false;
+    whole = whole * 10 + (text[pos] - '0');
+  }
+  if (pos < text.size() && ++pos == text.size())
+    return false; // "3." is not a number to Mullion
+  for (; pos < text.size(); ++pos) {
+    if (text[pos] < '0' || text[pos] > '9')
+      return false;
+    fraction = fraction * 10 + (text[pos] - '0');
+    divisor *= 10;
+  }
+  const double value = whole + fraction / divisor;
+  if (!std::isfinite(value))
     return false;
   *out = std::clamp(static_cast<float>(value), 1.0f, kMaxFactor);
   return true;
 }
 
-// the file name of this process's executable, which Mullion's [section] lines are matched against
+#ifdef _WIN32
+std::string toUtf8(const WCHAR *text, int length = -1) {
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text, length, nullptr, 0, nullptr, nullptr);
+  std::string out(size > 0 ? size : 0, '\0');
+  if (size > 0)
+    WideCharToMultiByte(CP_UTF8, 0, text, length, out.data(), size, nullptr, nullptr);
+  if (length < 0 && !out.empty())
+    out.pop_back(); // the terminator
+  return out;
+}
+
+std::wstring toWide(const std::string &text) {
+  const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+  std::wstring out(size > 0 ? size : 0, L'\0');
+  if (size > 0)
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), size);
+  if (!out.empty())
+    out.pop_back();
+  return out;
+}
+#endif
+
+// A variable as Mullion reads it (env::getEnvVar): UTF-8, and a MULLION_ name falls back to its DXMT_ one.
+// On Windows it is read wide, as getenv would hand back the ANSI code page's version of a macOS path.
+std::string envVar(const std::string &name) {
+  std::string value;
+#ifdef _WIN32
+  const std::wstring wide = toWide(name);
+  const DWORD size = GetEnvironmentVariableW(wide.c_str(), nullptr, 0);
+  if (size > 0) {
+    std::vector<WCHAR> buffer(size);
+    const DWORD length = GetEnvironmentVariableW(wide.c_str(), buffer.data(), size);
+    value = toUtf8(buffer.data(), static_cast<int>(length));
+  }
+#else
+  if (const char *env = std::getenv(name.c_str()))
+    value = env;
+#endif
+  if (value.empty() && name.rfind("MULLION_", 0) == 0)
+    return envVar("DXMT_" + name.substr(8));
+  return value;
+}
+
+// the file name of this process's executable, which Mullion's [section] lines are matched against (UTF-8)
 std::string exeName() {
 #ifdef _WIN32
-  char path[MAX_PATH] = {};
-  const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-  std::string name(path, length);
+  std::vector<WCHAR> path(32768);
+  const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+  const std::string name = toUtf8(path.data(), static_cast<int>(length));
   const size_t slash = name.find_last_of("\\/");
   return slash == std::string::npos ? name : name.substr(slash + 1);
 #else
@@ -93,50 +153,60 @@ void parseLine(const std::string &line, const std::string &exe, bool *active, st
     (*out)[key] = value;
 }
 
-FILE *openConfig(const char *path) {
-  if (FILE *file = std::fopen(path, "rb"))
-    return file;
+// a config file by its UTF-8 name, as Mullion opens it
+FILE *openConfig(const std::string &path) {
 #ifdef _WIN32
+  if (FILE *file = _wfopen(toWide(path).c_str(), L"rb"))
+    return file;
   // under Wine the variable usually holds a macOS path, which only Wine can turn into one Windows opens
+  // (wine_get_dos_file_name takes the Unix path in UTF-8)
   using DosName = WCHAR *(CDECL *)(const char *);
   static const auto to_dos = reinterpret_cast<DosName>(
       reinterpret_cast<void *>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "wine_get_dos_file_name")));
-  if (to_dos && path[0] == '/') {
-    if (WCHAR *dos = to_dos(path)) {
+  if (to_dos && !path.empty() && path[0] == '/') {
+    if (WCHAR *dos = to_dos(path.c_str())) {
       FILE *file = _wfopen(dos, L"rb");
       HeapFree(GetProcessHeap(), 0, dos);
       return file;
     }
   }
-#endif
   return nullptr;
+#else
+  return std::fopen(path.c_str(), "rb");
+#endif
 }
 
-// Mullion's options as Mullion would see them in this process: the file, then MULLION_CONFIG's lines over it
+// Mullion's options as Mullion would see them in this process (Config::getUserConfig): the file
+// MULLION_CONFIG_FILE names, or mullion.conf (then dxmt.conf) in the working directory, then MULLION_CONFIG's
+// lines over it
 std::map<std::string, std::string> mullionOptions(std::string *where) {
   std::map<std::string, std::string> options;
   const std::string exe = exeName();
-  if (const char *path = std::getenv("MULLION_CONFIG_FILE"); path && *path) {
-    if (FILE *file = openConfig(path)) {
-      bool active = true;
-      std::string line;
-      char chunk[512];
-      while (std::fgets(chunk, sizeof(chunk), file)) {
-        line += chunk;
-        if (!line.empty() && line.back() != '\n' && !std::feof(file))
-          continue;
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-          line.pop_back();
-        parseLine(line, exe, &active, &options);
-        line.clear();
-      }
-      std::fclose(file);
-      *where = path;
-    }
+  std::string path = envVar("MULLION_CONFIG_FILE");
+  FILE *file = nullptr;
+  if (!path.empty()) {
+    file = openConfig(path);
+  } else if ((file = openConfig(path = "mullion.conf")) == nullptr) {
+    file = openConfig(path = "dxmt.conf");
   }
-  if (const char *lines = std::getenv("MULLION_CONFIG"); lines && *lines) {
+  if (file) {
     bool active = true;
-    std::string all = lines;
+    std::string line;
+    char chunk[512];
+    while (std::fgets(chunk, sizeof(chunk), file)) {
+      line += chunk;
+      if (!line.empty() && line.back() != '\n' && !std::feof(file))
+        continue;
+      while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+        line.pop_back();
+      parseLine(line, exe, &active, &options);
+      line.clear();
+    }
+    std::fclose(file);
+    *where = path;
+  }
+  if (const std::string all = envVar("MULLION_CONFIG"); !all.empty()) {
+    bool active = true;
     size_t start = 0;
     while (start <= all.size()) {
       const size_t end = std::min(all.find(';', start), all.size());
@@ -157,25 +227,36 @@ SpatialUpscale read() {
   if (auto it = options.find("d3d11.metalSpatialUpscaleFactor"); it != options.end())
     mullion_has_factor = parseFactor(it->second, &mullion_factor);
 
-  if (const char *env = std::getenv("METALVR_METALFX_SPATIAL"); env && *env) {
+  if (const std::string env = envVar("METALVR_METALFX_SPATIAL"); !env.empty()) {
     const std::string value = lower(env);
     result.source = "METALVR_METALFX_SPATIAL";
     float factor = 1.0f;
-    if (value == "0" || value == "off" || value == "false" || value == "no")
+    if (value == "0" || value == "off" || value == "false" || value == "no") {
       result.factor = 1.0f;
-    else if (value == "on" || value == "true" || value == "yes")
-      result.factor = mullion_factor;
-    else if (parseFactor(value, &factor))
+    } else if (value == "on" || value == "true" || value == "yes") {
+      // on means smaller eyes: Mullion's factor when it asks for that, else Mullion's default
+      result.enabled = true;
+      result.factor = mullion_factor > 1.0f ? mullion_factor : kDefaultFactor;
+    } else if (parseFactor(value, &factor)) {
+      result.enabled = true;
       result.factor = factor;
-    else
+    } else {
       result.source = "METALVR_METALFX_SPATIAL (not understood, so off)";
+    }
     return result;
   }
 
-  if (auto it = options.find("d3d11.metalSpatialUpscale"); it != options.end() && lower(it->second) == "true") {
+  // Mullion's own switches (d3d11_swapchain.cpp): MULLION_METALFX_SPATIAL_SWAPCHAIN=1 or d3d11.metalSpatialUpscale
+  std::string from;
+  if (envVar("MULLION_METALFX_SPATIAL_SWAPCHAIN") == "1")
+    from = "MULLION_METALFX_SPATIAL_SWAPCHAIN";
+  else if (auto it = options.find("d3d11.metalSpatialUpscale"); it != options.end() && lower(it->second) == "true")
+    from = "d3d11.metalSpatialUpscale";
+  if (!from.empty()) {
+    result.enabled = true;
     result.factor = mullion_factor;
-    result.source = "d3d11.metalSpatialUpscale" + std::string(mullion_has_factor ? "Factor" : " (factor 2)") +
-                    " in " + where;
+    result.source = from + (mullion_has_factor ? ", d3d11.metalSpatialUpscaleFactor" : ", factor 2 (Mullion's default)") +
+                    (where.empty() ? std::string() : " in " + where);
   }
   return result;
 }

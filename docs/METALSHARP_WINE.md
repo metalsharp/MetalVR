@@ -41,7 +41,7 @@ HKLM\SOFTWARE\Khronos\OpenXR\1
    | `METALVR_LOG=1` | the runtime logs to the game's stderr |
    | `METALVR_HEADSET_WAIT=<seconds>` | `xrGetSystem` waits that long for a headset to connect before answering that there is none; for games that treat a missing headset as fatal (every OpenVR game through OpenComposite) |
    | `METALVR_INTERACTION_PROFILE=<path>` | the interaction profile to prefer when a game suggests bindings for several, e.g. `/interaction_profiles/htc/vive_controller` for a game whose Vive bindings are the good ones |
-   | `METALVR_METALFX_SPATIAL=<factor>` | render each eye smaller by this factor (`1.5`, `2`) for `metalvrd` to scale up with MetalFX; `on` uses Mullion's factor, `0` or `off` turns it off whatever Mullion's config says. Unset, MetalVR follows MetalSharp's MetalFX toggle (below) |
+   | `METALVR_METALFX_SPATIAL=<factor>` | render each eye smaller by this factor (`1.5`, `2`; at most 4) for `metalvrd` to scale up with MetalFX; `on` uses Mullion's factor, or 2 if that is 1; `0` or `off` turns it off whatever Mullion's config says. Unset, MetalVR follows MetalSharp's MetalFX toggle (below) |
 
 ## MetalFX upscaling in VR
 
@@ -50,16 +50,25 @@ Mullion config file that `MULLION_CONFIG_FILE` names. Mullion applies them only 
 game's eyes never pass through one: they go to MetalVR's swapchains (OpenXR) or its SteamVR driver's textures, and
 Mullion's upscaling reaches only the game's desktop mirror window.
 
-So MetalVR reads the same two settings itself (`runtime/upscale.cpp`), from that file and from `MULLION_CONFIG`,
-with Mullion's `[game.exe]` sections, from the game's environment. With the toggle on and a factor above 1:
+So MetalVR reads the same settings itself (`runtime/upscale.cpp`) from the game's environment, as Mullion does
+(`Config::getUserConfig`, `env::getEnvVar`):
+
+- the file `MULLION_CONFIG_FILE` names, or `mullion.conf` (then `dxmt.conf`) in the game's working directory, then
+  the lines in `MULLION_CONFIG`, with Mullion's `[game.exe]` sections; each `MULLION_` variable also answers to its
+  `DXMT_` name;
+- on with `d3d11.metalSpatialUpscale = True` or `MULLION_METALFX_SPATIAL_SWAPCHAIN=1`, at
+  `d3d11.metalSpatialUpscaleFactor` (2 when it is missing or not a number Mullion reads; MetalVR stops at 4).
+
+With it on and a factor above 1:
 
 - the OpenXR runtime recommends each eye at the headset's size divided by the factor
   (`xrEnumerateViewConfigurationViews`; the largest size a game may ask for is unchanged), and the SteamVR
   driver's recommended render target size is divided the same way;
 - `metalvrd` scales the game's eyes (the bottom projection layer) up to the headset's with MetalFX's spatial
   scaler before composing when they are smaller (`daemon/compositor.mm`), and logs `compositor: MetalFX spatial
-  upscaling WxH to WxH per eye` once for each size. Layers blended over them (SteamVR's dashboard and overlays),
-  quad layers and foveated encoding are drawn as before.
+  upscaling WxH to WxH per eye` for the first sizes it sees. One scaler serves each eye whatever size the game
+  renders at, so dynamic resolution costs nothing more. Layers blended over the game's eyes (SteamVR's dashboard
+  and overlays), quad layers and foveated encoding are drawn as before.
 
 The scaling is done while the game waits for its frame to be taken (about 1 ms per eye at a Quest 3's size, on
 the Mac it was measured on), so it pays only in a game whose frame rate is held back by the size it renders at:
@@ -67,7 +76,7 @@ BONELAB went from about 28 to 60 frames a second at factor 2, while Blade & Sorc
 full size, had nothing to gain and ran slower.
 
 A factor of 1 (MetalSharp's default) renders at the headset's size, so the toggle changes nothing in VR until
-the factor is raised. `METALVR_METALFX_SPATIAL` in the game's environment overrides the config. `metalvrd` reads
+the factor is raised; the runtime (with `METALVR_LOG=1`) and the SteamVR driver say so in their logs. `METALVR_METALFX_SPATIAL` in the game's environment overrides the config. `metalvrd` reads
 the same variable from its own environment, where only `0` (`off`) matters: smaller eyes are then drawn with a
 bilinear sample, as before. A game that picks its own render size, or SteamVR's resolution setting, still decides
 how large the eyes are; whatever arrives smaller than the headset's eye is scaled with MetalFX either way.

@@ -1141,7 +1141,7 @@ public:
     p->SetBoolProperty(c, vr::Prop_NeverTracked_Bool, false);
     log("metalvr: headset '%s', %ux%u per eye, %.0f Hz", name, system.eye_width, system.eye_height,
         system.refresh_hz);
-    if (spatialUpscale().factor > 1.0f)
+    if (spatialUpscale().enabled)
       log("metalvr: MetalFX spatial upscaling: rendering %ux%u per eye (factor %.2f, from %s)",
           upscaledRenderSize(system.eye_width), upscaledRenderSize(system.eye_height), spatialUpscale().factor,
           spatialUpscale().source.c_str());

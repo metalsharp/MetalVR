@@ -204,11 +204,27 @@ int Compositor::upscaler(id<MTLTexture> source, uint32_t in_width, uint32_t in_h
   const MTLPixelFormat format = source.pixelFormat;
   if (std::find(unscalable_.begin(), unscalable_.end(), format) != unscalable_.end())
     return -1;
+  // a few sizes are logged; an application with dynamic resolution would otherwise log one a frame
+  const auto note = [&] {
+    char what[160];
+    std::snprintf(what, sizeof(what), "%ux%u to %ux%u per eye (pixel format %lu, %s)", in_width, in_height,
+                  out_width, out_height, static_cast<unsigned long>(format),
+                  isLinearFormat(format) ? "HDR" : "perceptual");
+    if (upscale_logged_.size() < 8 && upscale_logged_.insert(what).second)
+      logInfo("compositor: MetalFX spatial upscaling %s%s", what,
+              upscale_logged_.size() == 8 ? "; further sizes are not logged" : "");
+  };
   for (size_t i = 0; i < upscalers_.size(); ++i) {
     Upscaler &u = upscalers_[i];
-    if (u.used != frame_ && u.format == format && u.in_width == in_width && u.in_height == in_height &&
-        u.out_width == out_width && u.out_height == out_height) {
+    if (u.used != frame_ && u.format == format && u.out_width == out_width && u.out_height == out_height) {
       u.used = frame_;
+      if (@available(macOS 13.0, *)) {
+        if (u.scaler.inputContentWidth != in_width || u.scaler.inputContentHeight != in_height) {
+          u.scaler.inputContentWidth = in_width;
+          u.scaler.inputContentHeight = in_height;
+          note();
+        }
+      }
       return static_cast<int>(i);
     }
   }
@@ -218,18 +234,26 @@ int Compositor::upscaler(id<MTLTexture> source, uint32_t in_width, uint32_t in_h
     MTLFXSpatialScalerDescriptor *desc = [MTLFXSpatialScalerDescriptor new];
     desc.colorTextureFormat = working;
     desc.outputTextureFormat = working;
-    desc.inputWidth = in_width;
-    desc.inputHeight = in_height;
+    desc.inputWidth = out_width; // the most a view may fill: only views no larger than the eye are scaled
+    desc.inputHeight = out_height;
     desc.outputWidth = out_width;
     desc.outputHeight = out_height;
     // a float texture holds linear light, which may go past 1; anything else holds display-referred values
     desc.colorProcessingMode = isLinearFormat(format) ? MTLFXSpatialScalerColorProcessingModeHDR
                                                       : MTLFXSpatialScalerColorProcessingModePerceptual;
     id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice:device_];
+    if (!scaler) {
+      unscalable_.push_back(format);
+      logInfo("compositor: MetalFX cannot scale pixel format %lu; those eyes are drawn bilinearly",
+              static_cast<unsigned long>(format));
+      return -1;
+    }
     id<MTLTexture> input = nil, color = nil, output = nil;
-    if (scaler) {
-      MTLTextureDescriptor *input_desc =
-          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:in_width height:in_height mipmapped:NO];
+    {
+      MTLTextureDescriptor *input_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                                           width:out_width
+                                                                                          height:out_height
+                                                                                       mipmapped:NO];
       input_desc.usage = scaler.colorTextureUsage | MTLTextureUsagePixelFormatView;
       input_desc.storageMode = MTLStorageModePrivate;
       input = [device_ newTextureWithDescriptor:input_desc];
@@ -242,10 +266,12 @@ int Compositor::upscaler(id<MTLTexture> source, uint32_t in_width, uint32_t in_h
       output_desc.storageMode = MTLStorageModePrivate;
       output = [device_ newTextureWithDescriptor:output_desc];
     }
-    if (!scaler || !color || !output) {
-      unscalable_.push_back(format);
-      logInfo("compositor: MetalFX cannot scale pixel format %lu; those eyes are drawn bilinearly",
-              static_cast<unsigned long>(format));
+    if (!color || !output) {
+      // out of memory, perhaps for now: drawn bilinearly, and tried again next frame
+      if (!upscale_alloc_logged_)
+        logInfo("compositor: MetalFX's textures for %ux%u could not be made; drawing bilinearly until they can",
+                out_width, out_height);
+      upscale_alloc_logged_ = true;
       return -1;
     }
     scaler.colorTexture = color;
@@ -253,8 +279,6 @@ int Compositor::upscaler(id<MTLTexture> source, uint32_t in_width, uint32_t in_h
     scaler.inputContentWidth = in_width;
     scaler.inputContentHeight = in_height;
     u.format = format;
-    u.in_width = in_width;
-    u.in_height = in_height;
     u.out_width = out_width;
     u.out_height = out_height;
     u.scaler = scaler;
@@ -263,12 +287,7 @@ int Compositor::upscaler(id<MTLTexture> source, uint32_t in_width, uint32_t in_h
     u.used = frame_;
     upscalers_.push_back(u);
     ++upscalers_created_;
-    char what[160];
-    std::snprintf(what, sizeof(what), "%ux%u to %ux%u per eye (pixel format %lu, %s)", in_width, in_height,
-                  out_width, out_height, static_cast<unsigned long>(format),
-                  isLinearFormat(format) ? "HDR" : "perceptual");
-    if (upscale_logged_.insert(what).second)
-      logInfo("compositor: MetalFX spatial upscaling %s", what);
+    note();
     return static_cast<int>(upscalers_.size() - 1);
   }
   return -1;

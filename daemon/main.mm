@@ -297,54 +297,71 @@ int upscaleCheck() {
   int failures = 0;
   for (const MTLPixelFormat format : {MTLPixelFormatBGRA8Unorm_sRGB, MTLPixelFormatRGBA16Float}) {
     const bool half = format == MTLPixelFormatRGBA16Float;
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
-                                                                                  width:in_w * 2
-                                                                                 height:in_h
-                                                                              mipmapped:NO];
-    td.storageMode = MTLStorageModeShared;
-    td.usage = MTLTextureUsageShaderRead; // as metalvrd opens an application's shared texture
-    id<MTLTexture> texture = [device newTextureWithDescriptor:td];
-    std::vector<uint8_t> bytes(static_cast<size_t>(in_w) * 2 * in_h * 4);
-    std::vector<__fp16> halves(static_cast<size_t>(in_w) * 2 * in_h * 4);
-    for (uint32_t y = 0; y < in_h; ++y)
-      for (uint32_t x = 0; x < in_w * 2; ++x) {
-        const uint32_t eye = x >= in_w ? 1 : 0;
-        // the position in perceptual values, so 8 bits hold it evenly
-        const uint32_t row = eye ? in_h - 1 - y : y;
-        const double c[3] = {(x - eye * in_w + 0.5) / in_w, (row + 0.5) / in_h, eye ? 1.0 : 0.0};
-        const size_t i = (static_cast<size_t>(y) * in_w * 2 + x) * 4;
-        if (half) {
-          for (int k = 0; k < 3; ++k)
-            halves[i + k] = static_cast<__fp16>(decode(c[k]));
-          halves[i + 3] = 1;
-        } else {
-          bytes[i + 0] = static_cast<uint8_t>(std::lround(c[2] * 255)); // BGRA
-          bytes[i + 1] = static_cast<uint8_t>(std::lround(c[1] * 255));
-          bytes[i + 2] = static_cast<uint8_t>(std::lround(c[0] * 255));
-          bytes[i + 3] = 255;
+    // both eyes side by side in one texture, each eye's colour its own position
+    const auto eyes = [&](uint32_t w, uint32_t h) {
+      MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                                    width:w * 2
+                                                                                   height:h
+                                                                                mipmapped:NO];
+      td.storageMode = MTLStorageModeShared;
+      td.usage = MTLTextureUsageShaderRead; // as metalvrd opens an application's shared texture
+      id<MTLTexture> texture = [device newTextureWithDescriptor:td];
+      std::vector<uint8_t> bytes(static_cast<size_t>(w) * 2 * h * 4);
+      std::vector<__fp16> halves(static_cast<size_t>(w) * 2 * h * 4);
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w * 2; ++x) {
+          const uint32_t eye = x >= w ? 1 : 0;
+          // the position in perceptual values, so 8 bits hold it evenly
+          const uint32_t row = eye ? h - 1 - y : y;
+          const double c[3] = {(x - eye * w + 0.5) / w, (row + 0.5) / h, eye ? 1.0 : 0.0};
+          const size_t i = (static_cast<size_t>(y) * w * 2 + x) * 4;
+          if (half) {
+            for (int k = 0; k < 3; ++k)
+              halves[i + k] = static_cast<__fp16>(decode(c[k]));
+            halves[i + 3] = 1;
+          } else {
+            bytes[i + 0] = static_cast<uint8_t>(std::lround(c[2] * 255)); // BGRA
+            bytes[i + 1] = static_cast<uint8_t>(std::lround(c[1] * 255));
+            bytes[i + 2] = static_cast<uint8_t>(std::lround(c[0] * 255));
+            bytes[i + 3] = 255;
+          }
         }
+      if (half)
+        [texture replaceRegion:MTLRegionMake2D(0, 0, w * 2, h) mipmapLevel:0 withBytes:halves.data()
+                   bytesPerRow:w * 2 * 8];
+      else
+        [texture replaceRegion:MTLRegionMake2D(0, 0, w * 2, h) mipmapLevel:0 withBytes:bytes.data()
+                   bytesPerRow:w * 2 * 4];
+      ComposeFrame frame;
+      ComposeLayer layer;
+      layer.type = MVR_LAYER_PROJECTION;
+      for (int eye = 0; eye < 2; ++eye)
+        layer.views[eye].texture = texture;
+      layer.views[0].rect = {0, 0, static_cast<int32_t>(w), static_cast<int32_t>(h)};
+      // the right eye upside down in the texture, and its rect mirrored to say so, as an OpenGL application's are
+      layer.views[1].rect = {static_cast<int32_t>(w), static_cast<int32_t>(h), static_cast<int32_t>(w),
+                             -static_cast<int32_t>(h)};
+      frame.layers.push_back(layer);
+      return frame;
+    };
+    // Two frames at a larger size first, then the one checked: the scalers are the ones kept from those frames,
+    // told the new size, as for an application whose render size changes from frame to frame. Smaller after
+    // larger, so the input still holds the larger frame's pixels past the checked one's edges.
+    const ComposeFrame larger = eyes(in_w * 5 / 4, in_h * 5 / 4), frame = eyes(in_w, in_h);
+    CVPixelBufferRef buffer = nullptr;
+    uint32_t made_before = 0;
+    for (int i = 0; i < 3; ++i) {
+      if (buffer)
+        CVPixelBufferRelease(buffer);
+      if (i == 2)
+        made_before = compositor.upscalersCreated();
+      buffer = compositor.compose(i < 2 ? larger : frame);
+      if (!buffer) {
+        std::fprintf(stderr, "--upscale-check: compose failed\n");
+        return 1;
       }
-    if (half)
-      [texture replaceRegion:MTLRegionMake2D(0, 0, in_w * 2, in_h) mipmapLevel:0 withBytes:halves.data()
-                 bytesPerRow:in_w * 2 * 8];
-    else
-      [texture replaceRegion:MTLRegionMake2D(0, 0, in_w * 2, in_h) mipmapLevel:0 withBytes:bytes.data()
-                 bytesPerRow:in_w * 2 * 4];
-    ComposeFrame frame;
-    ComposeLayer layer;
-    layer.type = MVR_LAYER_PROJECTION;
-    for (int eye = 0; eye < 2; ++eye)
-      layer.views[eye].texture = texture;
-    layer.views[0].rect = {0, 0, static_cast<int32_t>(in_w), static_cast<int32_t>(in_h)};
-    // the right eye upside down in the texture, and its rect mirrored to say so, as an OpenGL application's are
-    layer.views[1].rect = {static_cast<int32_t>(in_w), static_cast<int32_t>(in_h), static_cast<int32_t>(in_w),
-                           -static_cast<int32_t>(in_h)};
-    frame.layers.push_back(layer);
-    CVPixelBufferRef buffer = compositor.compose(frame);
-    if (!buffer) {
-      std::fprintf(stderr, "--upscale-check: compose failed\n");
-      return 1;
     }
+    const uint32_t made_after = compositor.upscalersCreated() - made_before;
     const uint32_t scaled = compositor.lastUpscaledViews();
     CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
     const uint8_t *base = static_cast<const uint8_t *>(CVPixelBufferGetBaseAddress(buffer));
@@ -368,12 +385,13 @@ int upscaleCheck() {
     CVPixelBufferRelease(buffer);
     // a gradient is smooth, so the scaler's sharpening must leave it within a few steps of 8 bits
     const double mean = counted ? total / (2.0 * counted) : 1;
-    const bool ok = scaled == 2 && counted > 10000 && wrong_eye == 0 && worst < 0.03 && mean < 0.006;
-    std::printf("%s: %s %ux%u per eye to %ux%u; %u eyes by MetalFX, %llu pixels, mean %.4f worst %.4f off, "
-                "%llu from the wrong eye\n",
-                ok ? "PASSED" : "FAILED", half ? "RGBA16Float" : "BGRA8Unorm_sRGB", in_w, in_h, out_eye_w,
-                out_eye_h, scaled, static_cast<unsigned long long>(counted), mean, worst,
-                static_cast<unsigned long long>(wrong_eye));
+    const bool ok = scaled == 2 && made_after == 0 && counted > 10000 && wrong_eye == 0 && worst < 0.03 &&
+                    mean < 0.006;
+    std::printf("%s: %s %ux%u per eye (after %ux%u) to %ux%u; %u eyes by MetalFX, %u scalers made for the new size, "
+                "%llu pixels, mean %.4f worst %.4f off, %llu from the wrong eye\n",
+                ok ? "PASSED" : "FAILED", half ? "RGBA16Float" : "BGRA8Unorm_sRGB", in_w, in_h, in_w * 5 / 4,
+                in_h * 5 / 4, out_eye_w, out_eye_h, scaled, made_after, static_cast<unsigned long long>(counted), mean,
+                worst, static_cast<unsigned long long>(wrong_eye));
     failures += !ok;
   }
   // SteamVR's layers come and go (its dashboard, overlays): frames of one projection layer and of two at different

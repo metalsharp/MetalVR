@@ -456,7 +456,7 @@ MVR_API xrEnumerateViewConfigurationViews(XrInstance handle, XrSystemId system_i
   const uint32_t width = upscaledRenderSize(instance->system.eye_width);
   const uint32_t height = upscaledRenderSize(instance->system.eye_height);
   static std::once_flag logged;
-  if (width != instance->system.eye_width || height != instance->system.eye_height)
+  if (spatialUpscale().enabled)
     std::call_once(logged, [&] {
       logLine("MetalFX spatial upscaling: recommending %ux%u per eye for %ux%u (factor %.2f, from %s)", width, height,
               instance->system.eye_width, instance->system.eye_height, spatialUpscale().factor,
