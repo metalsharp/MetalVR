@@ -5,6 +5,7 @@
 #import <Metal/Metal.h>
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -60,21 +61,27 @@ public:
   // how many the last compose scaled (for --upscale-check)
   bool upscalesWithMetalFX() const { return metalfx_; }
   uint32_t lastUpscaledViews() const { return last_upscaled_; }
+  uint32_t upscalersCreated() const { return upscalers_created_; }
 
 private:
   // MetalFX spatial upscaling of a projection view smaller than its eye: the view's rect is copied out of the
-  // application's texture (MetalFX reads from the origin) and scaled to the eye's size; one of these per view
+  // application's texture (MetalFX reads from the origin) and scaled to the eye's size. Each view of a frame takes
+  // one of these of its size and format, kept across frames however the layers come and go (SteamVR's change
+  // with its dashboard), since making one takes far longer than a frame has.
   struct Upscaler {
     MTLPixelFormat format = MTLPixelFormatInvalid; // the application's
     uint32_t in_width = 0, in_height = 0, out_width = 0, out_height = 0;
     id<MTLFXSpatialScaler> scaler = nil;
     id<MTLTexture> input = nil;  // the view's rect, in the application's format
     id<MTLTexture> output = nil; // the eye, at its full size
+    uint64_t used = 0;           // the last frame that took it
   };
 
   id<MTLRenderPipelineState> pipeline(bool blend);
-  Upscaler *upscaler(size_t slot, id<MTLTexture> source, uint32_t in_width, uint32_t in_height, uint32_t out_width,
-                     uint32_t out_height);
+  // the index of an upscaler of this size and format that this frame has not taken yet, made if there is none;
+  // -1 when MetalFX cannot scale it
+  int upscaler(id<MTLTexture> source, uint32_t in_width, uint32_t in_height, uint32_t out_width,
+               uint32_t out_height);
 
   id<MTLDevice> device_;
   id<MTLCommandQueue> queue_;
@@ -90,8 +97,10 @@ private:
   bool metalfx_ = false; // MetalFX spatial upscaling on this GPU, and not turned off
   std::vector<Upscaler> upscalers_;
   std::vector<MTLPixelFormat> unscalable_; // formats MetalFX refused, drawn bilinearly
-  std::string upscale_logged_;
+  std::set<std::string> upscale_logged_;   // each size and format, logged once
+  uint64_t frame_ = 0;
   uint32_t last_upscaled_ = 0;
+  uint32_t upscalers_created_ = 0;
 };
 
 // writes a composed frame as a PNG, for inspecting what the server would send

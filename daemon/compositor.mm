@@ -199,18 +199,20 @@ Compositor::Compositor(id<MTLDevice> device) : device_(device) {
   }
 }
 
-Compositor::Upscaler *Compositor::upscaler(size_t slot, id<MTLTexture> source, uint32_t in_width,
-                                           uint32_t in_height, uint32_t out_width, uint32_t out_height) {
+int Compositor::upscaler(id<MTLTexture> source, uint32_t in_width, uint32_t in_height, uint32_t out_width,
+                         uint32_t out_height) {
   const MTLPixelFormat format = source.pixelFormat;
   if (std::find(unscalable_.begin(), unscalable_.end(), format) != unscalable_.end())
-    return nullptr;
-  if (upscalers_.size() <= slot)
-    upscalers_.resize(slot + 1);
-  Upscaler &u = upscalers_[slot];
-  if (u.scaler && u.format == format && u.in_width == in_width && u.in_height == in_height &&
-      u.out_width == out_width && u.out_height == out_height)
-    return &u;
-  u = Upscaler{};
+    return -1;
+  for (size_t i = 0; i < upscalers_.size(); ++i) {
+    Upscaler &u = upscalers_[i];
+    if (u.used != frame_ && u.format == format && u.in_width == in_width && u.in_height == in_height &&
+        u.out_width == out_width && u.out_height == out_height) {
+      u.used = frame_;
+      return static_cast<int>(i);
+    }
+  }
+  Upscaler u;
   if (@available(macOS 13.0, *)) {
     const MTLPixelFormat working = scalerFormat(format);
     MTLFXSpatialScalerDescriptor *desc = [MTLFXSpatialScalerDescriptor new];
@@ -244,7 +246,7 @@ Compositor::Upscaler *Compositor::upscaler(size_t slot, id<MTLTexture> source, u
       unscalable_.push_back(format);
       logInfo("compositor: MetalFX cannot scale pixel format %lu; those eyes are drawn bilinearly",
               static_cast<unsigned long>(format));
-      return nullptr;
+      return -1;
     }
     scaler.colorTexture = color;
     scaler.outputTexture = output;
@@ -258,17 +260,18 @@ Compositor::Upscaler *Compositor::upscaler(size_t slot, id<MTLTexture> source, u
     u.scaler = scaler;
     u.input = input;
     u.output = output;
+    u.used = frame_;
+    upscalers_.push_back(u);
+    ++upscalers_created_;
     char what[160];
     std::snprintf(what, sizeof(what), "%ux%u to %ux%u per eye (pixel format %lu, %s)", in_width, in_height,
                   out_width, out_height, static_cast<unsigned long>(format),
                   isLinearFormat(format) ? "HDR" : "perceptual");
-    if (upscale_logged_ != what) {
-      upscale_logged_ = what;
+    if (upscale_logged_.insert(what).second)
       logInfo("compositor: MetalFX spatial upscaling %s", what);
-    }
-    return &u;
+    return static_cast<int>(upscalers_.size() - 1);
   }
-  return nullptr;
+  return -1;
 }
 
 Compositor::~Compositor() {
@@ -407,8 +410,13 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
     std::vector<id<MTLTexture>> upscaled(frame.layers.size() * 2, nil);
     last_upscaled_ = 0;
     if (metalfx_) {
+      // one no frame has taken for this long (about ten seconds at 72 Hz) belongs to a size that is gone
+      ++frame_;
+      upscalers_.erase(std::remove_if(upscalers_.begin(), upscalers_.end(),
+                                      [&](const Upscaler &u) { return frame_ - u.used > 720; }),
+                       upscalers_.end());
       struct Job {
-        size_t slot;
+        size_t index;
         id<MTLTexture> source;
         mvr_rect rect;
       };
@@ -433,9 +441,10 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
           const uint32_t w = static_cast<uint32_t>(rw), h = static_cast<uint32_t>(rh);
           if (w > eye_width || h > compose_height || (w == eye_width && h == compose_height))
             continue;
-          if (Upscaler *u = upscaler(jobs.size(), view.texture, w, h, eye_width, compose_height)) {
-            upscaled[l * 2 + eye] = u->output;
-            jobs.push_back({jobs.size(), view.texture, r});
+          const int index = upscaler(view.texture, w, h, eye_width, compose_height);
+          if (index >= 0) {
+            upscaled[l * 2 + eye] = upscalers_[index].output;
+            jobs.push_back({static_cast<size_t>(index), view.texture, r});
           }
         }
       }
@@ -447,14 +456,14 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
                     sourceLevel:0
                    sourceOrigin:MTLOriginMake(job.rect.x, job.rect.y, 0)
                      sourceSize:MTLSizeMake(job.rect.width, job.rect.height, 1)
-                      toTexture:upscalers_[job.slot].input
+                      toTexture:upscalers_[job.index].input
                destinationSlice:0
                destinationLevel:0
               destinationOrigin:MTLOriginMake(0, 0, 0)];
         [blit endEncoding];
         if (@available(macOS 13.0, *)) {
           for (const Job &job : jobs)
-            [upscalers_[job.slot].scaler encodeToCommandBuffer:commands];
+            [upscalers_[job.index].scaler encodeToCommandBuffer:commands];
         }
         last_upscaled_ = static_cast<uint32_t>(jobs.size());
       }

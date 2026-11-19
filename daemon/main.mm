@@ -376,6 +376,48 @@ int upscaleCheck() {
                 static_cast<unsigned long long>(wrong_eye));
     failures += !ok;
   }
+  // SteamVR's layers come and go (its dashboard, overlays): frames of one projection layer and of two at different
+  // sizes, one after another, must keep reusing the scalers they had, as making one takes longer than a frame
+  {
+    const auto eyes = [&](uint32_t w, uint32_t h) {
+      MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                                                    width:w * 2
+                                                                                   height:h
+                                                                                mipmapped:NO];
+      td.usage = MTLTextureUsageShaderRead;
+      ComposeLayer layer;
+      layer.type = MVR_LAYER_PROJECTION;
+      id<MTLTexture> t = [device newTextureWithDescriptor:td];
+      for (int eye = 0; eye < 2; ++eye) {
+        layer.views[eye].texture = t;
+        layer.views[eye].rect = {static_cast<int32_t>(eye * w), 0, static_cast<int32_t>(w), static_cast<int32_t>(h)};
+      }
+      return layer;
+    };
+    ComposeFrame one, two;
+    // the larger layer alone, then under the smaller one: matched by position in the frame, every frame would
+    // need its scalers made again
+    one.layers.push_back(eyes(800, 880));
+    two.layers.push_back(eyes(640, 704));
+    two.layers.push_back(eyes(800, 880));
+    two.layers.back().flags = MVR_LAYER_BLEND_ALPHA;
+    uint32_t after_first = 0, scaled = 0;
+    bool composed = true;
+    for (int i = 0; i < 20 && composed; ++i) {
+      CVPixelBufferRef buffer = compositor.compose(i % 2 ? two : one);
+      composed = buffer != nullptr;
+      if (buffer)
+        CVPixelBufferRelease(buffer);
+      scaled += compositor.lastUpscaledViews();
+      if (i == 1)
+        after_first = compositor.upscalersCreated();
+    }
+    const uint32_t made = compositor.upscalersCreated() - after_first;
+    const bool ok = composed && made == 0 && scaled == 10 * 2 + 10 * 4;
+    std::printf("%s: layers changing for 20 frames: %u eyes by MetalFX, %u scalers made after the first two frames\n",
+                ok ? "PASSED" : "FAILED", scaled, made);
+    failures += !ok;
+  }
   return failures ? 1 : 0;
 }
 
