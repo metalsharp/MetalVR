@@ -754,6 +754,22 @@ bool driftsInYaw(uint32_t headset) {
   }
 }
 
+// whether a headset's poses reach metalvrd already predicted for the moment the frame drawn from them is shown:
+// the headsets that stream through ALVR, whose client predicts every pose it sends
+bool posesArrivePredicted(uint32_t headset) {
+  switch (headset) {
+  case MVR_HEADSET_QUEST_1:
+  case MVR_HEADSET_QUEST_2:
+  case MVR_HEADSET_QUEST_3:
+  case MVR_HEADSET_QUEST_3S:
+  case MVR_HEADSET_QUEST_PRO:
+  case MVR_HEADSET_STEAM_FRAME:
+    return true;
+  default:
+    return false;
+  }
+}
+
 class Controller final : public TrackedDevice {
 public:
   Controller(Link &link, uint32_t hand) : link_(link), hand_(hand) {}
@@ -1247,13 +1263,22 @@ private:
     pose.vecPosition[0] = sample.head.position.x;
     pose.vecPosition[1] = sample.head.position.y;
     pose.vecPosition[2] = sample.head.position.z;
-    pose.vecVelocity[0] = sample.head_linear_velocity.x;
-    pose.vecVelocity[1] = sample.head_linear_velocity.y;
-    pose.vecVelocity[2] = sample.head_linear_velocity.z;
-    pose.vecAngularVelocity[0] = sample.head_angular_velocity.x;
-    pose.vecAngularVelocity[1] = sample.head_angular_velocity.y;
-    pose.vecAngularVelocity[2] = sample.head_angular_velocity.z;
-    // the sample is for now: how long ago that was, so SteamVR predicts from the right moment
+    // A pose that arrives predicted is the one the headset reprojects from: SteamVR must render with it as it is.
+    // With the head's velocities SteamVR would predict it again, to its own display time, and render with a pose
+    // the headset never sent; Present then names the nearest sample, the headset reprojects from a pose the frame
+    // was not drawn with, and the picture swims by the turn rate times SteamVR's prediction. Without velocities
+    // SteamVR's prediction leaves the pose as it is, Present finds the very sample, and the headset reprojects
+    // exactly. Only the head: controllers keep theirs, which games read for throws.
+    if (!posesArrivePredicted(headset_)) {
+      pose.vecVelocity[0] = sample.head_linear_velocity.x;
+      pose.vecVelocity[1] = sample.head_linear_velocity.y;
+      pose.vecVelocity[2] = sample.head_linear_velocity.z;
+      pose.vecAngularVelocity[0] = sample.head_angular_velocity.x;
+      pose.vecAngularVelocity[1] = sample.head_angular_velocity.y;
+      pose.vecAngularVelocity[2] = sample.head_angular_velocity.z;
+    }
+    // the sample is for now: how long ago that was, so SteamVR predicts from the right moment (the controllers'
+    // poses take this offset too)
     const int64_t now_server = localNowNs() + link_.connection().clockOffsetNs();
     pose.poseTimeOffset = -static_cast<double>(now_server - sample.time_ns) / 1e9;
     if (out_sample)
