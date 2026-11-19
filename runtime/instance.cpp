@@ -1,6 +1,7 @@
 // Instance, system, paths, events and the object registry.
 #include "api.h"
 #include "metalvr_headsets.h"
+#include "upscale.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -451,11 +452,21 @@ MVR_API xrEnumerateViewConfigurationViews(XrInstance handle, XrSystemId system_i
     return XR_ERROR_SIZE_INSUFFICIENT;
   if (!views)
     return XR_ERROR_VALIDATION_FAILURE;
+  // with MetalFX spatial upscaling the application renders smaller eyes and metalvrd scales them up (upscale.h)
+  const uint32_t width = upscaledRenderSize(instance->system.eye_width);
+  const uint32_t height = upscaledRenderSize(instance->system.eye_height);
+  static std::once_flag logged;
+  if (width != instance->system.eye_width || height != instance->system.eye_height)
+    std::call_once(logged, [&] {
+      logLine("MetalFX spatial upscaling: recommending %ux%u per eye for %ux%u (factor %.2f, from %s)", width, height,
+              instance->system.eye_width, instance->system.eye_height, spatialUpscale().factor,
+              spatialUpscale().source.c_str());
+    });
   for (uint32_t i = 0; i < 2; ++i) {
     if (views[i].type != XR_TYPE_VIEW_CONFIGURATION_VIEW)
       return XR_ERROR_VALIDATION_FAILURE;
-    views[i].recommendedImageRectWidth = instance->system.eye_width;
-    views[i].recommendedImageRectHeight = instance->system.eye_height;
+    views[i].recommendedImageRectWidth = width;
+    views[i].recommendedImageRectHeight = height;
     views[i].maxImageRectWidth = kMaxSwapchainSize;
     views[i].maxImageRectHeight = kMaxSwapchainSize;
     views[i].recommendedSwapchainSampleCount = 1;

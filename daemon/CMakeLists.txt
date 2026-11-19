@@ -176,6 +176,7 @@ target_compile_options(metalvrd PRIVATE -fobjc-arc)
 target_link_libraries(metalvrd PRIVATE
   "-framework Foundation"
   "-framework Metal"
+  "-framework MetalFX"
   "-framework CoreVideo"
   "-framework CoreMedia"
   "-framework VideoToolbox"

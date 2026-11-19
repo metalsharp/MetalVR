@@ -3,9 +3,13 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
+#import <MetalFX/MetalFX.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 #include "common.h"
 #include "metalvr_math.h"
@@ -138,6 +142,28 @@ bool isLinearFormat(MTLPixelFormat format) {
   }
 }
 
+// The format MetalFX works in. An sRGB texture's bytes are given to it as they are, values in a perceptual space as
+// its perceptual mode expects; its output is then a UNORM texture of those values, which layer_fragment decodes as
+// it does any 8-bit UNORM source.
+MTLPixelFormat scalerFormat(MTLPixelFormat format) {
+  switch (format) {
+  case MTLPixelFormatRGBA8Unorm_sRGB:
+    return MTLPixelFormatRGBA8Unorm;
+  case MTLPixelFormatBGRA8Unorm_sRGB:
+    return MTLPixelFormatBGRA8Unorm;
+  default:
+    return format;
+  }
+}
+
+// METALVR_METALFX_SPATIAL=0 (off, false, no) draws smaller eyes bilinearly, as before MetalFX (runtime/upscale.h)
+bool metalfxTurnedOff() {
+  const char *env = std::getenv("METALVR_METALFX_SPATIAL");
+  if (!env)
+    return false;
+  return !std::strcmp(env, "0") || !strcasecmp(env, "off") || !strcasecmp(env, "false") || !strcasecmp(env, "no");
+}
+
 // the clip-space position of a point given in the eye's own space
 void project(const mvr_fov &fov, mvr_vec3 p, float out[4]) {
   float tl = std::tan(fov.left), tr = std::tan(fov.right), tu = std::tan(fov.up), td = std::tan(fov.down);
@@ -162,6 +188,87 @@ Compositor::Compositor(id<MTLDevice> device) : device_(device) {
   sampler.sAddressMode = MTLSamplerAddressModeClampToEdge;
   sampler.tAddressMode = MTLSamplerAddressModeClampToEdge;
   sampler_ = [device_ newSamplerStateWithDescriptor:sampler];
+  if (@available(macOS 13.0, *)) {
+    if (metalfxTurnedOff())
+      logInfo("compositor: MetalFX spatial upscaling turned off by METALVR_METALFX_SPATIAL");
+    else if (![MTLFXSpatialScalerDescriptor supportsDevice:device_])
+      logInfo("compositor: MetalFX spatial upscaling is not supported on %s; smaller eyes are drawn bilinearly",
+              device_.name.UTF8String);
+    else
+      metalfx_ = true;
+  }
+}
+
+Compositor::Upscaler *Compositor::upscaler(size_t slot, id<MTLTexture> source, uint32_t in_width,
+                                           uint32_t in_height, uint32_t out_width, uint32_t out_height) {
+  const MTLPixelFormat format = source.pixelFormat;
+  if (std::find(unscalable_.begin(), unscalable_.end(), format) != unscalable_.end())
+    return nullptr;
+  if (upscalers_.size() <= slot)
+    upscalers_.resize(slot + 1);
+  Upscaler &u = upscalers_[slot];
+  if (u.scaler && u.format == format && u.in_width == in_width && u.in_height == in_height &&
+      u.out_width == out_width && u.out_height == out_height)
+    return &u;
+  u = Upscaler{};
+  if (@available(macOS 13.0, *)) {
+    const MTLPixelFormat working = scalerFormat(format);
+    MTLFXSpatialScalerDescriptor *desc = [MTLFXSpatialScalerDescriptor new];
+    desc.colorTextureFormat = working;
+    desc.outputTextureFormat = working;
+    desc.inputWidth = in_width;
+    desc.inputHeight = in_height;
+    desc.outputWidth = out_width;
+    desc.outputHeight = out_height;
+    // a float texture holds linear light, which may go past 1; anything else holds display-referred values
+    desc.colorProcessingMode = isLinearFormat(format) ? MTLFXSpatialScalerColorProcessingModeHDR
+                                                      : MTLFXSpatialScalerColorProcessingModePerceptual;
+    id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice:device_];
+    id<MTLTexture> input = nil, color = nil, output = nil;
+    if (scaler) {
+      MTLTextureDescriptor *input_desc =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:in_width height:in_height mipmapped:NO];
+      input_desc.usage = scaler.colorTextureUsage | MTLTextureUsagePixelFormatView;
+      input_desc.storageMode = MTLStorageModePrivate;
+      input = [device_ newTextureWithDescriptor:input_desc];
+      color = working == format ? input : [input newTextureViewWithPixelFormat:working];
+      MTLTextureDescriptor *output_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:working
+                                                                                            width:out_width
+                                                                                           height:out_height
+                                                                                        mipmapped:NO];
+      output_desc.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+      output_desc.storageMode = MTLStorageModePrivate;
+      output = [device_ newTextureWithDescriptor:output_desc];
+    }
+    if (!scaler || !color || !output) {
+      unscalable_.push_back(format);
+      logInfo("compositor: MetalFX cannot scale pixel format %lu; those eyes are drawn bilinearly",
+              static_cast<unsigned long>(format));
+      return nullptr;
+    }
+    scaler.colorTexture = color;
+    scaler.outputTexture = output;
+    scaler.inputContentWidth = in_width;
+    scaler.inputContentHeight = in_height;
+    u.format = format;
+    u.in_width = in_width;
+    u.in_height = in_height;
+    u.out_width = out_width;
+    u.out_height = out_height;
+    u.scaler = scaler;
+    u.input = input;
+    u.output = output;
+    char what[160];
+    std::snprintf(what, sizeof(what), "%ux%u to %ux%u per eye (pixel format %lu, %s)", in_width, in_height,
+                  out_width, out_height, static_cast<unsigned long>(format),
+                  isLinearFormat(format) ? "HDR" : "perceptual");
+    if (upscale_logged_ != what) {
+      upscale_logged_ = what;
+      logInfo("compositor: MetalFX spatial upscaling %s", what);
+    }
+    return &u;
+  }
+  return nullptr;
 }
 
 Compositor::~Compositor() {
@@ -293,12 +400,72 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
 
     id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+    const uint32_t eye_width = compose_width / 2;
+
+    // MetalFX first: a projection view smaller than the eye (an application rendering below the headset's size
+    // for upscaling, runtime/upscale.h) is scaled up to the eye's size here, and drawn 1:1 below
+    std::vector<id<MTLTexture>> upscaled(frame.layers.size() * 2, nil);
+    last_upscaled_ = 0;
+    if (metalfx_) {
+      struct Job {
+        size_t slot;
+        id<MTLTexture> source;
+        mvr_rect rect;
+      };
+      std::vector<Job> jobs;
+      for (size_t l = 0; l < frame.layers.size(); ++l) {
+        const ComposeLayer &layer = frame.layers[l];
+        if (layer.type != MVR_LAYER_PROJECTION)
+          continue;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+          const ComposeLayerView &view = layer.views[eye];
+          if (!view.texture || view.texture.textureType != MTLTextureType2D)
+            continue;
+          // a mirrored rect (negative extents) is scaled by the region it covers, and flipped when drawn
+          const int64_t x0 = std::min<int64_t>(view.rect.x, int64_t{view.rect.x} + view.rect.width);
+          const int64_t y0 = std::min<int64_t>(view.rect.y, int64_t{view.rect.y} + view.rect.height);
+          const int64_t rw = std::abs(int64_t{view.rect.width}), rh = std::abs(int64_t{view.rect.height});
+          if (x0 < 0 || y0 < 0 || rw == 0 || rh == 0 || x0 + rw > static_cast<int64_t>(view.texture.width) ||
+              y0 + rh > static_cast<int64_t>(view.texture.height))
+            continue;
+          const mvr_rect r = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), static_cast<int32_t>(rw),
+                              static_cast<int32_t>(rh)};
+          const uint32_t w = static_cast<uint32_t>(rw), h = static_cast<uint32_t>(rh);
+          if (w > eye_width || h > compose_height || (w == eye_width && h == compose_height))
+            continue;
+          if (Upscaler *u = upscaler(jobs.size(), view.texture, w, h, eye_width, compose_height)) {
+            upscaled[l * 2 + eye] = u->output;
+            jobs.push_back({jobs.size(), view.texture, r});
+          }
+        }
+      }
+      if (!jobs.empty()) {
+        id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+        for (const Job &job : jobs)
+          [blit copyFromTexture:job.source
+                    sourceSlice:0
+                    sourceLevel:0
+                   sourceOrigin:MTLOriginMake(job.rect.x, job.rect.y, 0)
+                     sourceSize:MTLSizeMake(job.rect.width, job.rect.height, 1)
+                      toTexture:upscalers_[job.slot].input
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        if (@available(macOS 13.0, *)) {
+          for (const Job &job : jobs)
+            [upscalers_[job.slot].scaler encodeToCommandBuffer:commands];
+        }
+        last_upscaled_ = static_cast<uint32_t>(jobs.size());
+      }
+    }
+
     id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
     [encoder setFragmentSamplerState:sampler_ atIndex:0];
 
-    const uint32_t eye_width = compose_width / 2;
     bool first = true;
-    for (const ComposeLayer &layer : frame.layers) {
+    for (size_t l = 0; l < frame.layers.size(); ++l) {
+      const ComposeLayer &layer = frame.layers[l];
       const bool alpha = (layer.flags & MVR_LAYER_BLEND_ALPHA) != 0;
       // the bottom layer covers the eye whatever its alpha holds; a quad never does
       const bool blend = layer.type == MVR_LAYER_QUAD ? alpha : (alpha && !first);
@@ -314,9 +481,17 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
         if (layer.type == MVR_LAYER_QUAD && !(layer.eye_mask & (1u << eye)))
           continue;
 
+        id<MTLTexture> texture = view.texture;
         const float tw = static_cast<float>(view.texture.width), th = static_cast<float>(view.texture.height);
-        const float u0 = view.rect.x / tw, u1 = (view.rect.x + view.rect.width) / tw;
-        const float v0 = view.rect.y / th, v1 = (view.rect.y + view.rect.height) / th;
+        float u0 = view.rect.x / tw, u1 = (view.rect.x + view.rect.width) / tw;
+        float v0 = view.rect.y / th, v1 = (view.rect.y + view.rect.height) / th;
+        if (layer.type == MVR_LAYER_PROJECTION && upscaled[l * 2 + eye]) {
+          texture = upscaled[l * 2 + eye]; // the whole of it, the eye's size, flipped as the rect was
+          u0 = view.rect.width < 0 ? 1 : 0;
+          u1 = 1 - u0;
+          v0 = view.rect.height < 0 ? 1 : 0;
+          v1 = 1 - v0;
+        }
 
         Vertex vertices[4];
         if (layer.type == MVR_LAYER_QUAD) {
@@ -347,7 +522,7 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
         }
 
         Uniforms uniforms{};
-        MTLPixelFormat format = view.texture.pixelFormat;
+        MTLPixelFormat format = texture.pixelFormat;
         uniforms.decode_gamma = !decodesWhenSampled(format) && !isLinearFormat(format);
         uniforms.unpremultiplied = (layer.flags & MVR_LAYER_UNPREMULTIPLIED_ALPHA) != 0;
         uniforms.opaque = !blend;
@@ -359,7 +534,7 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
         [encoder setScissorRect:scissor];
         [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-        [encoder setFragmentTexture:view.texture atIndex:0];
+        [encoder setFragmentTexture:texture atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
       }
       first = false;

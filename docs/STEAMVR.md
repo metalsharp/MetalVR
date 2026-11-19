@@ -9,7 +9,10 @@ SteamVR Home render into it. OpenXR games don't need SteamVR: they use MetalVR's
 SteamVR loads `driver_metalvr.dll` into its server process, `vrserver.exe`. The driver:
 
 - connects to `metalvrd` on the loopback port, as the OpenXR runtime does, and registers one HMD with the
-  headset's name, refresh rate, per-eye render size and field of view;
+  headset's name, refresh rate, per-eye render size and field of view. With MetalFX upscaling on, the render size
+  it recommends is the headset's divided by the factor and `metalvrd` scales the eyes back up; the driver reads the
+  setting from `vrserver.exe`'s environment, where a `[game.exe]` section of Mullion's config does not apply
+  ([METALSHARP_WINE.md](METALSHARP_WINE.md#metalfx-upscaling-in-vr));
 - sends SteamVR the head's pose about 500 times a second;
 - takes SteamVR's frames in **direct mode**. SteamVR's compositor renders each eye into textures the driver made.
   These are Mullion shared textures, so `metalvrd` opens the same Metal textures and shows each frame with its own

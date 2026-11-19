@@ -5,10 +5,13 @@
 #import <Metal/Metal.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "foveation.h"
 #include "metalvr_protocol.h"
+
+@protocol MTLFXSpatialScaler;
 
 namespace metalvr {
 
@@ -53,8 +56,25 @@ public:
   // Draws the frame and waits for the GPU to finish it. The caller releases the returned buffer; null on failure.
   CVPixelBufferRef compose(const ComposeFrame &frame);
 
+  // whether eyes smaller than the frame's are scaled up with MetalFX (the GPU has it and it is not turned off), and
+  // how many the last compose scaled (for --upscale-check)
+  bool upscalesWithMetalFX() const { return metalfx_; }
+  uint32_t lastUpscaledViews() const { return last_upscaled_; }
+
 private:
+  // MetalFX spatial upscaling of a projection view smaller than its eye: the view's rect is copied out of the
+  // application's texture (MetalFX reads from the origin) and scaled to the eye's size; one of these per view
+  struct Upscaler {
+    MTLPixelFormat format = MTLPixelFormatInvalid; // the application's
+    uint32_t in_width = 0, in_height = 0, out_width = 0, out_height = 0;
+    id<MTLFXSpatialScaler> scaler = nil;
+    id<MTLTexture> input = nil;  // the view's rect, in the application's format
+    id<MTLTexture> output = nil; // the eye, at its full size
+  };
+
   id<MTLRenderPipelineState> pipeline(bool blend);
+  Upscaler *upscaler(size_t slot, id<MTLTexture> source, uint32_t in_width, uint32_t in_height, uint32_t out_width,
+                     uint32_t out_height);
 
   id<MTLDevice> device_;
   id<MTLCommandQueue> queue_;
@@ -67,6 +87,11 @@ private:
   CVPixelBufferPoolRef pool_ = nullptr;
   uint32_t width_ = 0;
   uint32_t height_ = 0;
+  bool metalfx_ = false; // MetalFX spatial upscaling on this GPU, and not turned off
+  std::vector<Upscaler> upscalers_;
+  std::vector<MTLPixelFormat> unscalable_; // formats MetalFX refused, drawn bilinearly
+  std::string upscale_logged_;
+  uint32_t last_upscaled_ = 0;
 };
 
 // writes a composed frame as a PNG, for inspecting what the server would send

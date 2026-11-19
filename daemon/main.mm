@@ -92,6 +92,7 @@ void usage() {
       "  --survive-check [sim]    start libsurvive (Lighthouse positions) for a few seconds, list what it tracks;\n"
       "                           sim: its simulated device and base stations, which must be tracked\n"
       "  --foveation-check        squeeze a test picture for foveated encoding on the GPU, check it, and exit\n"
+      "  --upscale-check          scale smaller eyes up with MetalFX as an upscaling game's are, check them, and exit\n"
       "  --panel-check MODEL PNG  draw the lens-check grid for rift-cv1, rift-s, index, vive, vive-pro, vive-pro-2\n"
       "                           or psvr2 into PNG, check each eye's straight-ahead mark, and exit\n"
       "  --software-encoder       encode on the CPU; for machines with no hardware encoder, not for a headset\n",
@@ -276,6 +277,108 @@ int foveationCheck() {
   return ok ? 0 : 1;
 }
 
+// --upscale-check: eyes rendered at 2/3 of the headset's size, as with METALVR_METALFX_SPATIAL=1.5, side by side in
+// one texture as SteamVR hands them over (the right eye's rect away from the origin, and mirrored upside down), in
+// an 8-bit sRGB format and a float one. Each eye's colour is its own position (red across, green down, blue which
+// eye); MetalFX must have scaled both eyes, and every pixel of the frame must show its own point of its own eye.
+int upscaleCheck() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  const uint32_t in_w = 640, in_h = 704, out_eye_w = 960, out_eye_h = 1056;
+  Compositor compositor(device);
+  if (!device || !compositor.configure(out_eye_w * 2, out_eye_h)) {
+    std::fprintf(stderr, "--upscale-check: no compositor\n");
+    return 1;
+  }
+  if (!compositor.upscalesWithMetalFX()) {
+    std::printf("SKIPPED: MetalFX spatial upscaling is not available here (see the line above)\n");
+    return 0;
+  }
+  const auto decode = [](double c) { return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); };
+  int failures = 0;
+  for (const MTLPixelFormat format : {MTLPixelFormatBGRA8Unorm_sRGB, MTLPixelFormatRGBA16Float}) {
+    const bool half = format == MTLPixelFormatRGBA16Float;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                                  width:in_w * 2
+                                                                                 height:in_h
+                                                                              mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageShaderRead; // as metalvrd opens an application's shared texture
+    id<MTLTexture> texture = [device newTextureWithDescriptor:td];
+    std::vector<uint8_t> bytes(static_cast<size_t>(in_w) * 2 * in_h * 4);
+    std::vector<__fp16> halves(static_cast<size_t>(in_w) * 2 * in_h * 4);
+    for (uint32_t y = 0; y < in_h; ++y)
+      for (uint32_t x = 0; x < in_w * 2; ++x) {
+        const uint32_t eye = x >= in_w ? 1 : 0;
+        // the position in perceptual values, so 8 bits hold it evenly
+        const uint32_t row = eye ? in_h - 1 - y : y;
+        const double c[3] = {(x - eye * in_w + 0.5) / in_w, (row + 0.5) / in_h, eye ? 1.0 : 0.0};
+        const size_t i = (static_cast<size_t>(y) * in_w * 2 + x) * 4;
+        if (half) {
+          for (int k = 0; k < 3; ++k)
+            halves[i + k] = static_cast<__fp16>(decode(c[k]));
+          halves[i + 3] = 1;
+        } else {
+          bytes[i + 0] = static_cast<uint8_t>(std::lround(c[2] * 255)); // BGRA
+          bytes[i + 1] = static_cast<uint8_t>(std::lround(c[1] * 255));
+          bytes[i + 2] = static_cast<uint8_t>(std::lround(c[0] * 255));
+          bytes[i + 3] = 255;
+        }
+      }
+    if (half)
+      [texture replaceRegion:MTLRegionMake2D(0, 0, in_w * 2, in_h) mipmapLevel:0 withBytes:halves.data()
+                 bytesPerRow:in_w * 2 * 8];
+    else
+      [texture replaceRegion:MTLRegionMake2D(0, 0, in_w * 2, in_h) mipmapLevel:0 withBytes:bytes.data()
+                 bytesPerRow:in_w * 2 * 4];
+    ComposeFrame frame;
+    ComposeLayer layer;
+    layer.type = MVR_LAYER_PROJECTION;
+    for (int eye = 0; eye < 2; ++eye)
+      layer.views[eye].texture = texture;
+    layer.views[0].rect = {0, 0, static_cast<int32_t>(in_w), static_cast<int32_t>(in_h)};
+    // the right eye upside down in the texture, and its rect mirrored to say so, as an OpenGL application's are
+    layer.views[1].rect = {static_cast<int32_t>(in_w), static_cast<int32_t>(in_h), static_cast<int32_t>(in_w),
+                           -static_cast<int32_t>(in_h)};
+    frame.layers.push_back(layer);
+    CVPixelBufferRef buffer = compositor.compose(frame);
+    if (!buffer) {
+      std::fprintf(stderr, "--upscale-check: compose failed\n");
+      return 1;
+    }
+    const uint32_t scaled = compositor.lastUpscaledViews();
+    CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    const uint8_t *base = static_cast<const uint8_t *>(CVPixelBufferGetBaseAddress(buffer));
+    const size_t stride = CVPixelBufferGetBytesPerRow(buffer);
+    double worst = 0, total = 0;
+    uint64_t wrong_eye = 0, counted = 0;
+    for (uint32_t y = 4; y + 4 < out_eye_h; y += 5)
+      for (uint32_t x = 0; x < out_eye_w * 2; x += 5) {
+        const uint32_t eye = x >= out_eye_w ? 1 : 0, ex = x - eye * out_eye_w;
+        if (ex < 4 || ex + 4 >= out_eye_w)
+          continue; // the eye's edges, where a scaler clamps
+        const uint8_t *p = base + y * stride + x * 4; // BGRA, sRGB
+        wrong_eye += (p[0] > 127) != (eye == 1);
+        const double dx = std::fabs(p[2] / 255.0 - (ex + 0.5) / out_eye_w);
+        const double dy = std::fabs(p[1] / 255.0 - (y + 0.5) / out_eye_h);
+        worst = std::max(worst, std::max(dx, dy));
+        total += dx + dy;
+        ++counted;
+      }
+    CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferRelease(buffer);
+    // a gradient is smooth, so the scaler's sharpening must leave it within a few steps of 8 bits
+    const double mean = counted ? total / (2.0 * counted) : 1;
+    const bool ok = scaled == 2 && counted > 10000 && wrong_eye == 0 && worst < 0.03 && mean < 0.006;
+    std::printf("%s: %s %ux%u per eye to %ux%u; %u eyes by MetalFX, %llu pixels, mean %.4f worst %.4f off, "
+                "%llu from the wrong eye\n",
+                ok ? "PASSED" : "FAILED", half ? "RGBA16Float" : "BGRA8Unorm_sRGB", in_w, in_h, out_eye_w,
+                out_eye_h, scaled, static_cast<unsigned long long>(counted), mean, worst,
+                static_cast<unsigned long long>(wrong_eye));
+    failures += !ok;
+  }
+  return failures ? 1 : 0;
+}
+
 // --passthrough-check: an Index's home drawn with a stereo camera picture (left half red, right half blue); the
 // middle of each eye must show its own half
 int passthroughCheck() {
@@ -440,6 +543,8 @@ int main(int argc, char **argv) {
         return surviveCheck(i + 1 < argc && std::string(argv[i + 1]) == "sim");
       else if (arg == "--foveation-check")
         return foveationCheck();
+      else if (arg == "--upscale-check")
+        return upscaleCheck();
       else if (arg == "--panel-check") {
         const std::string key = value();
         return panelCheck(key, value());
