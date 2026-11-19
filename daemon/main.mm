@@ -402,18 +402,20 @@ int upscaleCheck() {
     two.layers.push_back(eyes(800, 880));
     two.layers.back().flags = MVR_LAYER_BLEND_ALPHA;
     uint32_t after_first = 0, scaled = 0;
-    bool composed = true;
+    bool composed = true, overlay_scaled = false;
     for (int i = 0; i < 20 && composed; ++i) {
       CVPixelBufferRef buffer = compositor.compose(i % 2 ? two : one);
       composed = buffer != nullptr;
       if (buffer)
         CVPixelBufferRelease(buffer);
       scaled += compositor.lastUpscaledViews();
+      // only the bottom layer: the blended one over it is sampled, not scaled with MetalFX
+      overlay_scaled |= (i % 2) && compositor.lastUpscaledViews() != 2;
       if (i == 1)
         after_first = compositor.upscalersCreated();
     }
     const uint32_t made = compositor.upscalersCreated() - after_first;
-    const bool ok = composed && made == 0 && scaled == 10 * 2 + 10 * 4;
+    const bool ok = composed && made == 0 && !overlay_scaled && scaled == 20 * 2;
     std::printf("%s: layers changing for 20 frames: %u eyes by MetalFX, %u scalers made after the first two frames\n",
                 ok ? "PASSED" : "FAILED", scaled, made);
     failures += !ok;

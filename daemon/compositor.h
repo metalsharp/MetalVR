@@ -64,10 +64,10 @@ public:
   uint32_t upscalersCreated() const { return upscalers_created_; }
 
 private:
-  // MetalFX spatial upscaling of a projection view smaller than its eye: the view's rect is copied out of the
-  // application's texture (MetalFX reads from the origin) and scaled to the eye's size. Each view of a frame takes
-  // one of these of its size and format, kept across frames however the layers come and go (SteamVR's change
-  // with its dashboard), since making one takes far longer than a frame has.
+  // MetalFX spatial upscaling of a view of the bottom projection layer smaller than its eye: the view's rect is
+  // copied out of the application's texture (MetalFX reads from the origin) and scaled to the eye's size. Each
+  // view of a frame takes one of these of its size and format, kept across frames however the layers come and go
+  // (SteamVR's change with its dashboard), since making one takes far longer than a frame has.
   struct Upscaler {
     MTLPixelFormat format = MTLPixelFormatInvalid; // the application's
     uint32_t in_width = 0, in_height = 0, out_width = 0, out_height = 0;

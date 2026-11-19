@@ -405,8 +405,10 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
     id<MTLCommandBuffer> commands = [queue_ commandBuffer];
     const uint32_t eye_width = compose_width / 2;
 
-    // MetalFX first: a projection view smaller than the eye (an application rendering below the headset's size
-    // for upscaling, runtime/upscale.h) is scaled up to the eye's size here, and drawn 1:1 below
+    // MetalFX first: the bottom layer's views, when it is a projection smaller than the eye (an application
+    // rendering below the headset's size for upscaling, runtime/upscale.h), are scaled up to the eye's size here
+    // and drawn 1:1 below. Layers over it (SteamVR's dashboard and overlays) are blended UI, which MetalFX is not
+    // made for; they are sampled as before. Scaling them too doubled the time an application waits on each frame.
     std::vector<id<MTLTexture>> upscaled(frame.layers.size() * 2, nil);
     last_upscaled_ = 0;
     if (metalfx_) {
@@ -421,7 +423,7 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
         mvr_rect rect;
       };
       std::vector<Job> jobs;
-      for (size_t l = 0; l < frame.layers.size(); ++l) {
+      for (size_t l = 0; l < std::min<size_t>(frame.layers.size(), 1); ++l) {
         const ComposeLayer &layer = frame.layers[l];
         if (layer.type != MVR_LAYER_PROJECTION)
           continue;

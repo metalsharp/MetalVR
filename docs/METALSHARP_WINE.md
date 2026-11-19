@@ -56,9 +56,15 @@ with Mullion's `[game.exe]` sections, from the game's environment. With the togg
 - the OpenXR runtime recommends each eye at the headset's size divided by the factor
   (`xrEnumerateViewConfigurationViews`; the largest size a game may ask for is unchanged), and the SteamVR
   driver's recommended render target size is divided the same way;
-- `metalvrd` scales each projection layer's eye that is smaller than the headset's eye up to it with MetalFX's
-  spatial scaler before composing (`daemon/compositor.mm`), and logs `compositor: MetalFX spatial upscaling
-  WxH to WxH per eye` once for each size. Quad layers and foveated encoding are unchanged.
+- `metalvrd` scales the game's eyes (the bottom projection layer) up to the headset's with MetalFX's spatial
+  scaler before composing when they are smaller (`daemon/compositor.mm`), and logs `compositor: MetalFX spatial
+  upscaling WxH to WxH per eye` once for each size. Layers blended over them (SteamVR's dashboard and overlays),
+  quad layers and foveated encoding are drawn as before.
+
+The scaling is done while the game waits for its frame to be taken (about 1 ms per eye at a Quest 3's size, on
+the Mac it was measured on), so it pays only in a game whose frame rate is held back by the size it renders at:
+BONELAB went from about 28 to 60 frames a second at factor 2, while Blade & Sorcery, which already held 72 at
+full size, had nothing to gain and ran slower.
 
 A factor of 1 (MetalSharp's default) renders at the headset's size, so the toggle changes nothing in VR until
 the factor is raised. `METALVR_METALFX_SPATIAL` in the game's environment overrides the config. `metalvrd` reads
