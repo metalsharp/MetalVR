@@ -11,6 +11,7 @@ add_library(driver_metalvr SHARED
   driver_metalvr.cpp
   "${CMAKE_SOURCE_DIR}/runtime/ipc.cpp"
   "${CMAKE_SOURCE_DIR}/runtime/backend_win32.cpp"
+  "${CMAKE_SOURCE_DIR}/runtime/upscale.cpp"
 )
 target_include_directories(driver_metalvr PRIVATE
   "${OPENVR_INCLUDE_DIR}"

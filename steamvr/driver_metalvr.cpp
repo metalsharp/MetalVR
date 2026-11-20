@@ -31,6 +31,7 @@
 #include "ipc.h"
 #include "metalvr_headsets.h"
 #include "metalvr_protocol.h"
+#include "upscale.h"
 
 namespace metalvr {
 // backend_win32.cpp: the bootstrap name of a Mullion shared texture's Metal port, from an NT handle of its mapping
@@ -152,6 +153,14 @@ public:
 
   Connection &connection() { return connection_; }
   const mvr_system_info &system() const { return system_; }
+
+  // The headset's own fields of view and eye distance, which a streamed headset (ALVR) reports only once it
+  // connects, usually after HELLO: until then the system info holds the model's defaults.
+  void setViews(const mvr_fov &left, const mvr_fov &right, float ipd) {
+    system_.fov[0] = left;
+    system_.fov[1] = right;
+    system_.ipd = ipd;
+  }
 
   // The tracking samples the headset's recent poses came from. A frame names the one it was rendered with in
   // FRAME_END: the headset reprojects from that sample's pose, and metalvrd's ALVR driver drops a frame that names
@@ -618,8 +627,9 @@ public:
   bool IsDisplayOnDesktop() override { return false; }
   bool IsDisplayRealDisplay() override { return false; }
   void GetRecommendedRenderTargetSize(uint32_t *w, uint32_t *h) override {
-    *w = system_.eye_width;
-    *h = system_.eye_height;
+    // smaller with MetalFX spatial upscaling, which metalvrd undoes (runtime/upscale.h)
+    *w = upscaledRenderSize(system_.eye_width);
+    *h = upscaledRenderSize(system_.eye_height);
   }
   void GetEyeOutputViewport(vr::EVREye eye, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) override {
     *x = eye == vr::Eye_Left ? 0 : system_.eye_width;
@@ -886,11 +896,15 @@ public:
       mvr_vec3 offset{0, 0, 0};
       if (kind_ != MVR_CONTROLLERS_INDEX && kind_ != MVR_CONTROLLERS_VIVE_WAND) {
         // the controller's own frame, which SteamVR's Touch models place their grip and tip from: the grip pose
-        // without its offset (RiftLinux: 60 degrees about x, at 0, -0.032, 0.040). Lighthouse controllers report
-        // their own frame as the grip already.
-        const mvr_quat grip_rotation{0.5f, 0, 0, 0.8660254f};
+        // without its offset. SteamVR's render models for every Touch controller (CV1, Rift S, Quest 2, Touch Plus,
+        // Touch Pro) put their openxr_grip component 20.6 degrees about x from that frame, at +-0.007, -0.0018, 0.102
+        // (x mirrored for the right hand), and SteamVR's OpenXR rebuilds the grip from it, so taking the same
+        // transform off here gives an application the grip the headset reported. (60 degrees, used before, is the
+        // angle between the grip and the aim: openxr_aim is at -39.4.) Lighthouse controllers report their own frame
+        // as the grip already.
+        const mvr_quat grip_rotation{0.17880222f, 0, 0, 0.98388504f}; // 20.6 degrees about x
         q = quatMultiply(c.grip.orientation, quatConjugate(grip_rotation));
-        offset = rotate(q, {0, -0.03207f, 0.04045f});
+        offset = rotate(q, {hand_ == 0 ? 0.007f : -0.007f, -0.00182941f, 0.1019482f});
       }
       pose.qRotation = {q.w, q.x, q.y, q.z};
       pose.vecPosition[0] = c.grip.position.x - offset.x;
@@ -1177,6 +1191,10 @@ public:
     p->SetBoolProperty(c, vr::Prop_NeverTracked_Bool, false);
     log("metalvr: headset '%s', %ux%u per eye, %.0f Hz", name, system.eye_width, system.eye_height,
         system.refresh_hz);
+    if (spatialUpscale().enabled)
+      log("metalvr: MetalFX spatial upscaling: rendering %ux%u per eye (factor %.2f, from %s)",
+          upscaledRenderSize(system.eye_width), upscaledRenderSize(system.eye_height), spatialUpscale().factor,
+          spatialUpscale().source.c_str());
     running_ = true;
     poses_ = std::thread([this] { poseThread(); });
     return vr::VRInitError_None;
@@ -1254,6 +1272,8 @@ private:
       if (id_ != vr::k_unTrackedDeviceIndexInvalid) {
         mvr_tracking_response sample{};
         const vr::DriverPose_t head = pose(&sample);
+        if (head.deviceIsConnected)
+          updateViews(sample);
         vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id_, head, sizeof(vr::DriverPose_t));
         updateBattery(sample);
         if (head.poseIsValid != last_valid_ || head.deviceIsConnected != last_connected_) {
@@ -1269,6 +1289,57 @@ private:
       }
       Sleep(2); // about 500 poses a second
     }
+  }
+
+  // SteamVR renders each eye with the projection and eye position it was given, and metalvrd sends the eyes on as
+  // they are drawn, so they have to be the headset's own: a streamed headset displays each half of the frame with
+  // its real, asymmetric field of view, and an image drawn with another one sits shifted in each eye, which the eyes
+  // cannot fuse. Those arrive with the tracking once the headset has connected; SteamVR is told whenever they change,
+  // as ALVR's own driver does (SetDisplayEyeToHead, SetDisplayProjectionRaw).
+  void updateViews(const mvr_tracking_response &sample) {
+    const mvr_fov &l = sample.views[0].fov, &r = sample.views[1].fov;
+    const auto usable = [](const mvr_fov &f) {
+      return f.left < 0 && f.right > 0 && f.up > 0 && f.down < 0 && f.right - f.left < 3.0f && f.up - f.down < 3.0f;
+    };
+    if (!usable(l) || !usable(r))
+      return;
+    const mvr_vec3 a = sample.views[0].pose.position, b = sample.views[1].pose.position;
+    float ipd = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) + (b.z - a.z) * (b.z - a.z));
+    const mvr_system_info &system = link_.system();
+    if (!(ipd > 0.04f && ipd < 0.09f))
+      ipd = system.ipd > 0 ? system.ipd : 0.0635f;
+    const auto same = [](const mvr_fov &x, const mvr_fov &y) {
+      return std::fabs(x.left - y.left) < 1e-4f && std::fabs(x.right - y.right) < 1e-4f &&
+             std::fabs(x.up - y.up) < 1e-4f && std::fabs(x.down - y.down) < 1e-4f;
+    };
+    if (views_sent_ && same(l, system.fov[0]) && same(r, system.fov[1]) && std::fabs(ipd - system.ipd) < 1e-4f)
+      return;
+    link_.setViews(l, r, ipd);
+    views_sent_ = true;
+
+    vr::HmdMatrix34_t eye_to_head[2] = {};
+    for (int eye = 0; eye < 2; ++eye) {
+      eye_to_head[eye].m[0][0] = eye_to_head[eye].m[1][1] = eye_to_head[eye].m[2][2] = 1.0f;
+      eye_to_head[eye].m[0][3] = (eye == 0 ? -0.5f : 0.5f) * ipd;
+    }
+    vr::HmdRect2_t projection[2] = {};
+    for (int eye = 0; eye < 2; ++eye) {
+      // as Display::GetProjectionRaw: OpenVR's top is the tangent of the angle below the axis
+      const mvr_fov &f = eye == 0 ? l : r;
+      projection[eye].vTopLeft = {{std::tan(f.left), std::tan(f.down)}};
+      projection[eye].vBottomRight = {{std::tan(f.right), std::tan(f.up)}};
+    }
+    auto *host = vr::VRServerDriverHost();
+    host->SetDisplayEyeToHead(id_, eye_to_head[0], eye_to_head[1]);
+    host->SetDisplayProjectionRaw(id_, projection[0], projection[1]);
+    vr::VRProperties()->SetFloatProperty(container_, vr::Prop_UserIpdMeters_Float, ipd);
+    vr::VREvent_Data_t data{};
+    data.ipd.ipdMeters = ipd;
+    host->VendorSpecificEvent(id_, vr::VREvent_IpdChanged, data, 0);
+    log("metalvr: the headset's views: IPD %.1f mm, left eye %.1f %.1f %.1f %.1f, right eye %.1f %.1f %.1f %.1f "
+        "degrees (left, right, up, down)",
+        ipd * 1000.0f, l.left * 57.29578f, l.right * 57.29578f, l.up * 57.29578f, l.down * 57.29578f,
+        r.left * 57.29578f, r.right * 57.29578f, r.up * 57.29578f, r.down * 57.29578f);
   }
 
   // the headset's charge, when it reports one, a few times a minute
@@ -1288,6 +1359,7 @@ private:
   }
 
   bool last_valid_ = false, last_connected_ = false;
+  bool views_sent_ = false;
   bool battery_valid_ = false;
   ULONGLONG battery_set_ = 0;
   uint32_t headset_ = MVR_HEADSET_UNKNOWN;
