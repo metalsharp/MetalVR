@@ -55,6 +55,7 @@ run native-psvr2-sense env METALVR_TEST_NAME=native-psvr2-sense METALVR_DAEMON_A
   "$root/scripts/test-native.sh" --frames 120 --expect-profile /interaction_profiles/oculus/touch_controller
 run headset-protocols "$root/build/native/tests/headset_protocol_check"
 run foveation "$root/build/native/daemon/metalvrd" --foveation-check
+run metalfx-upscale "$root/build/native/daemon/metalvrd" --upscale-check
 run libsurvive "$root/build/native/daemon/metalvrd" --survive-check sim
 if [ -f "$root/build/basalt/prefix/lib/libbasalt.dylib" ] && [ -x "$root/build/native/tests/rift_s_tracking_check" ]; then
   run rift-s-tracking "$root/build/native/tests/rift_s_tracking_check" 24

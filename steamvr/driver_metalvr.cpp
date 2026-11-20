@@ -31,6 +31,7 @@
 #include "ipc.h"
 #include "metalvr_headsets.h"
 #include "metalvr_protocol.h"
+#include "upscale.h"
 
 namespace metalvr {
 // backend_win32.cpp: the bootstrap name of a Mullion shared texture's Metal port, from an NT handle of its mapping
@@ -626,8 +627,9 @@ public:
   bool IsDisplayOnDesktop() override { return false; }
   bool IsDisplayRealDisplay() override { return false; }
   void GetRecommendedRenderTargetSize(uint32_t *w, uint32_t *h) override {
-    *w = system_.eye_width;
-    *h = system_.eye_height;
+    // smaller with MetalFX spatial upscaling, which metalvrd undoes (runtime/upscale.h)
+    *w = upscaledRenderSize(system_.eye_width);
+    *h = upscaledRenderSize(system_.eye_height);
   }
   void GetEyeOutputViewport(vr::EVREye eye, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) override {
     *x = eye == vr::Eye_Left ? 0 : system_.eye_width;
@@ -1205,6 +1207,10 @@ public:
     p->SetBoolProperty(c, vr::Prop_NeverTracked_Bool, false);
     log("metalvr: headset '%s', %ux%u per eye, %.0f Hz", name, system.eye_width, system.eye_height,
         system.refresh_hz);
+    if (spatialUpscale().enabled)
+      log("metalvr: MetalFX spatial upscaling: rendering %ux%u per eye (factor %.2f, from %s)",
+          upscaledRenderSize(system.eye_width), upscaledRenderSize(system.eye_height), spatialUpscale().factor,
+          spatialUpscale().source.c_str());
     running_ = true;
     poses_ = std::thread([this] { poseThread(); });
     return vr::VRInitError_None;

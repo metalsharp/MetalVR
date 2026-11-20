@@ -72,12 +72,16 @@ Read by the runtime, from the application's environment:
 | `METALVR_LOG=1` | the runtime logs to the application's stderr |
 | `METALVR_HEADSET_WAIT=<seconds>` | wait that long for a headset to connect before reporting that there is none |
 | `METALVR_INTERACTION_PROFILE=<path>` | the interaction profile to prefer when an application suggests bindings for several |
+| `METALVR_METALFX_SPATIAL=<factor>` | recommend eyes this many times smaller than the headset's (`1.5`, `2`; at most 4), for the server to scale up with MetalFX; `on` uses Mullion's factor, or 2 if that is 1; `0` or `off` turns it off. Unset, Mullion's own MetalFX settings decide, read as Mullion reads them (`d3d11.metalSpatialUpscale`, `d3d11.metalSpatialUpscaleFactor`, `MULLION_METALFX_SPATIAL_SWAPCHAIN`; [METALSHARP_WINE.md](METALSHARP_WINE.md#metalfx-upscaling-in-vr)). The SteamVR driver reads it too |
+
+Read by the server: `METALVR_METALFX_SPATIAL=0` (or `off`) draws eyes smaller than the headset's with a bilinear
+sample instead of scaling them up with MetalFX's spatial scaler, which it does otherwise on any GPU that has it.
 
 ## Test
 
 ```sh
 scripts/test-all.sh         # everything below, one line per case
-scripts/test-native.sh      # Metal application → metalvrd
+scripts/test-native.sh      # Metal application → metalvrd; METALVR_METALFX_SPATIAL=1.5 for upscaled eyes
 scripts/test-wine.sh        # Direct3D 11 application under Wine + Mullion → metalvrd
 scripts/test-openvr.sh      # OpenVR application → OpenComposite → MetalVR, under Wine + Mullion
 scripts/test-failures.sh    # no server, server killed mid-session, second application
@@ -91,7 +95,10 @@ commands) and `metalvrd --panel-check MODEL OUT.png`
 `metalvrd --survive-check sim` runs libsurvive on its own simulated room and checks the poses that come out;
 `build/native/tests/rift_s_tracking_check` moves a synthetic Rift S through a textured room and checks the path
 Basalt tracks from its rendered camera frames and IMU against the true one; and
-`metalvrd --passthrough-check` draws an Index's home with a test camera picture. The simulated headset tracks hands,
+`metalvrd --passthrough-check` draws an Index's home with a test camera picture, and `metalvrd --upscale-check`
+scales eyes rendered at 2/3 of the headset's size up with MetalFX (8-bit sRGB and float, one of them mirrored,
+after frames of another size) and checks every pixel lands where it belongs, and that changing layers and sizes
+make no new scalers. The simulated headset tracks hands,
 which `xr_smoke` locates through `XR_EXT_hand_tracking` in every test that runs it.
 `scripts/test-all.sh` runs these, and `--headset index`, `--headset vive` or `--headset psvr2` with the simulated
 headset for the interaction profiles of those controllers. Each headset's guide lists which of these cover it.

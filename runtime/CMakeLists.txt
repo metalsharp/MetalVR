@@ -5,6 +5,7 @@ set(RUNTIME_SOURCES
   hands.cpp
   dispatch.cpp
   ipc.cpp
+  upscale.cpp
 )
 
 if(WIN32)
